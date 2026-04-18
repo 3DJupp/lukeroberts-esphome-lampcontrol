@@ -1,0 +1,519 @@
+# =============================================================================
+# Luke Roberts Smart Lamp (Model F / Luvo) – ESPHome Gateway
+# -----------------------------------------------------------------------------
+# Tested on ESP32-S3-WROOM-1. Should also work on any ESP32 with BLE.
+# Protocol reference: Luke Roberts "Lamp Control API" v1.3 (2019-07-09).
+#
+# Custom control service:   44092840-0567-11E6-B862-0002A5D5C51B
+# External API endpoint:    44092842-0567-11E6-B862-0002A5D5C51B (write + notify)
+#
+# All commands start with 0xA0. The second byte is the API version (0x01 / 0x02).
+# Responses arrive as notifications on the same characteristic:
+#   00 OK | 81 Invalid Params | 84 Invalid Id
+#   87 Invalid Version | BC Bad Command | FC Forbidden (security code set)
+#
+# The lamp automatically drops the BLE connection after ~8 s of inactivity
+# (firmware >= 1.1.1). A lightweight ping keepalive keeps the link alive
+# while the user is actively interacting.
+# =============================================================================
+
+substitutions:
+  # --- Identity ---------------------------------------------------------------
+  device_name: "ESP32-S3 Luke Roberts Gateway"
+  name: "esp32-s3-lukeroberts-gw"
+
+  # --- Secrets (override via secrets.yaml or substitutions) -------------------
+  encryption_key: "REPLACE_WITH_API_ENCRYPTION_KEY"
+  ota_encryption_key: "REPLACE_WITH_OTA_PASSWORD"
+  ap_fallback_pw: "REPLACE_WITH_AP_FALLBACK_PASSWORD"
+
+  # --- Lamp BLE address ------------------------------------------------------
+  # Replace with the MAC of your Luke Roberts lamp.
+  lr01_mac: "AA:BB:CC:DD:EE:FF"
+  ble_cid: "LRBTLAMP"
+
+  # --- Luke Roberts External API (do not change) -----------------------------
+  lr_svc:  "44092840-0567-11E6-B862-0002A5D5C51B"
+  lr_char: "44092842-0567-11E6-B862-0002A5D5C51B"
+
+  # --- Keepalive ping interval (must be < 8 s lamp idle timeout) -------------
+  lr_keepalive: "6s"
+
+esphome:
+  name: ${name}
+  friendly_name: ${device_name}
+  comment: "Gateway to control a Luke Roberts smart lamp over BLE"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+# Home Assistant native API
+api:
+  encryption:
+    key: ${encryption_key}
+
+ota:
+  - platform: esphome
+    password: ${ota_encryption_key}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback captive portal when the configured Wi-Fi is unreachable
+  ap:
+    ssid: ${name}
+    password: ${ap_fallback_pw}
+
+captive_portal:
+
+# -----------------------------------------------------------------------------
+# Onboard status LED (ESP32-S3 DevKitC)
+# -----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: onboard_led
+    name: "Onboard LED"
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    effects:
+      - pulse:
+          transition_length: 550ms
+          update_interval: 550ms
+
+# -----------------------------------------------------------------------------
+# Globals for keepalive bookkeeping
+# -----------------------------------------------------------------------------
+globals:
+  - id: lr_last_cmd_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: lr_want_keepalive
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# -----------------------------------------------------------------------------
+# BLE client
+# auto_connect keeps the link up / reconnects automatically.
+# on_connect: read Device Information (service 0x180A) once.
+# -----------------------------------------------------------------------------
+ble_client:
+  - mac_address: ${lr01_mac}
+    id: "${ble_cid}"
+    auto_connect: true
+    on_connect:
+      then:
+        - logger.log: "Luke Roberts lamp connected"
+        - component.update: internal_firmware_revision
+        - component.update: internal_hardware_revision
+        - component.update: internal_manufacturer
+        - component.update: internal_model_number
+        - component.update: internal_serial_number
+        - component.update: internal_software_revision
+    on_disconnect:
+      then:
+        - logger.log: "Luke Roberts lamp disconnected"
+
+# -----------------------------------------------------------------------------
+# Main send script
+# If already connected, write immediately (<100 ms latency).
+# Otherwise connect first, wait for the link, then write. Never manually
+# disconnects – the lamp's own idle timeout handles that.
+# -----------------------------------------------------------------------------
+script:
+  - id: lr_send
+    mode: single
+    parameters:
+      payload: 'std::vector<uint8_t>'
+    then:
+      - lambda: |-
+          id(lr_last_cmd_ms) = millis();
+          id(lr_want_keepalive) = true;
+      - if:
+          condition:
+            lambda: 'return !id(${ble_cid}).connected();'
+          then:
+            - logger.log: "Lamp not connected – establishing link"
+            - ble_client.connect:
+                id: ${ble_cid}
+            - wait_until:
+                condition:
+                  lambda: 'return id(${ble_cid}).connected();'
+                timeout: 6s
+            - delay: 250ms
+      - ble_client.ble_write:
+          id: ${ble_cid}
+          service_uuid: ${lr_svc}
+          characteristic_uuid: ${lr_char}
+          value: !lambda 'return payload;'
+      - logger.log:
+          format: "Lamp <- %d bytes"
+          args: ['payload.size()']
+
+# -----------------------------------------------------------------------------
+# Keepalive using the official Ping command (A0 02 00).
+# Active only for 30 s after the last user command, and only while connected.
+# Once the user has been idle for 30 s the ping stops and the lamp is allowed
+# to disconnect normally.
+# -----------------------------------------------------------------------------
+interval:
+  - interval: ${lr_keepalive}
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(lr_want_keepalive)
+                  && id(${ble_cid}).connected()
+                  && (millis() - id(lr_last_cmd_ms)) < 30000;
+          then:
+            - ble_client.ble_write:
+                id: ${ble_cid}
+                service_uuid: ${lr_svc}
+                characteristic_uuid: ${lr_char}
+                value: [0xA0, 0x02, 0x00]    # Ping V=2
+      - if:
+          condition:
+            lambda: |-
+              return (millis() - id(lr_last_cmd_ms)) >= 30000;
+          then:
+            - lambda: 'id(lr_want_keepalive) = false;'
+
+# -----------------------------------------------------------------------------
+# Buttons – all byte sequences verified against Lamp Control API v1.3
+# -----------------------------------------------------------------------------
+button:
+  - platform: restart
+    name: "Restart"
+
+  # --- Diagnostic ping --------------------------------------------------------
+  - platform: template
+    name: "Ping"
+    icon: mdi:access-point
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x00};'   # Ping V=2
+
+  # --- Power / Scenes (A0 02 05 II) ------------------------------------------
+  - platform: template
+    name: "Lamp Off"
+    icon: mdi:lamp-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x00};'   # Off scene
+
+  - platform: template
+    name: "Default Scene"
+    icon: mdi:restore
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0xFF};'   # Power-up scene
+
+  - platform: template
+    name: "Scene 1"
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x01};'
+
+  - platform: template
+    name: "Scene 2"
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x02};'
+
+  # --- Modify Brightness (opcode 03, value in percent 0..100) ----------------
+  - platform: template
+    name: "Brightness 50%"
+    icon: mdi:brightness-5
+    on_press:
+      - script.execute:
+          id: lr_send
+          # A0 01 03 PP   (PP = 50 decimal = 0x32)
+          payload: !lambda 'return {0xA0, 0x01, 0x03, 0x32};'
+
+  # --- Modify Color Temperature (opcode 04, Kelvin big-endian 2700..4000) ----
+  - platform: template
+    name: "Color Temperature 3000K"
+    icon: mdi:thermometer
+    on_press:
+      - script.execute:
+          id: lr_send
+          # A0 01 04 KK KK   (3000 = 0x0BB8)
+          payload: !lambda 'return {0xA0, 0x01, 0x04, 0x0B, 0xB8};'
+
+  # --- Next Scene by Brightness (opcode 06, signed direction -1 / +1) --------
+  - platform: template
+    name: "Next Brighter Scene"
+    icon: mdi:arrow-up-bold
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x06, 0x01};'   # +1
+
+  - platform: template
+    name: "Next Dimmer Scene"
+    icon: mdi:arrow-down-bold
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x06, 0xFF};'   # -1 (signed)
+
+  # --- Relative Brightness (opcode 08, multiplicative, percent) --------------
+  - platform: template
+    name: "Brighter (+20%)"
+    icon: mdi:brightness-7
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x78};'   # 120% = 0x78
+
+  - platform: template
+    name: "Dimmer (-20%)"
+    icon: mdi:brightness-3
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x50};'   # 80% = 0x50
+
+  # --- Immediate Light (opcode 02) -------------------------------------------
+  # Structure: A0 01 02 XX DDDD [01 SS HHHH BB] [02 KKKK BB]
+  #   XX    = flags bitfield (bit0: uplight sub-packet, bit1: downlight)
+  #   DDDD  = duration in ms (0 = infinite, reverts on next scene select)
+  #   SS    = saturation 0..255
+  #   HHHH  = hue 0..65535 (or Kelvin when SS = 0)
+  #   KKKK  = Kelvin 2700..4000
+  #   BB    = brightness 0..255  (NOTE: not a percentage here)
+  # Example: downlight only, infinite, 3000 K, brightness ~50% (128/255)
+  - platform: template
+    name: "Immediate: Downlight 50% 3000K"
+    icon: mdi:lightbulb-on
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda |-
+            return {0xA0, 0x01, 0x02,
+                    0x02,           // flags: downlight sub-packet only
+                    0x00, 0x00,     // duration: infinite
+                    0x0B, 0xB8,     // 3000 K
+                    0x80};          // brightness 128/255 (~50%)
+
+# -----------------------------------------------------------------------------
+# Text sensors
+# - Device Information (service 0x180A): pulled once on connect
+# - Luke Roberts API Response: decoded live from the External API notify
+# -----------------------------------------------------------------------------
+text_sensor:
+  - platform: uptime
+    name: "Uptime"
+    icon: mdi:clock-check-outline
+
+  # --- Visible diagnostic sensors --------------------------------------------
+  - platform: template
+    name: "Manufacturer"
+    id: manufacturer
+    icon: mdi:factory
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Model Number"
+    id: model_number
+    icon: mdi:ipod
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Serial Number"
+    id: serial_number
+    icon: mdi:barcode
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Hardware Revision"
+    id: hardware_revision
+    icon: mdi:chip
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Firmware Revision"
+    id: firmware_revision
+    icon: mdi:memory-arrow-down
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Software Revision"
+    id: software_revision
+    icon: mdi:code-braces
+    entity_category: diagnostic
+
+  # --- Internal BLE readers (Device Information Service 0x180A) ---------------
+  - platform: ble_client
+    id: internal_manufacturer
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A29"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: manufacturer
+                  state: !lambda 'return x.c_str();'
+
+  - platform: ble_client
+    id: internal_model_number
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A24"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: model_number
+                  state: !lambda 'return x.c_str();'
+
+  - platform: ble_client
+    id: internal_serial_number
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A25"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: serial_number
+                  state: !lambda 'return x.c_str();'
+
+  - platform: ble_client
+    id: internal_hardware_revision
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A27"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: hardware_revision
+                  state: !lambda 'return x.c_str();'
+
+  - platform: ble_client
+    id: internal_firmware_revision
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A26"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: firmware_revision
+                  state: !lambda 'return x.c_str();'
+
+  - platform: ble_client
+    id: internal_software_revision
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: "180A"
+    characteristic_uuid: "2A28"
+    update_interval: never
+    on_value:
+      then:
+        - if:
+            condition: { lambda: 'return x.size() > 0;' }
+            then:
+              - text_sensor.template.publish:
+                  id: software_revision
+                  state: !lambda 'return x.c_str();'
+
+  # --- Visible decoded API response sensor ------------------------------------
+  - platform: template
+    name: "Luke Roberts API Response"
+    id: lr_api_response
+    icon: mdi:message-reply-text
+    entity_category: diagnostic
+
+  # --- Internal notify listener on the External API characteristic ------------
+  # Decodes status codes from Lamp Control API v1.3:
+  #   00 OK | 81 Invalid Params | 84 Invalid Id
+  #   87 Invalid Version | BC Bad Command | FC Forbidden
+  # `x` arrives as std::string where every char is a raw byte.
+  - platform: ble_client
+    id: lr_api_response_raw
+    internal: true
+    ble_client_id: ${ble_cid}
+    service_uuid: ${lr_svc}
+    characteristic_uuid: ${lr_char}
+    notify: true
+    update_interval: never
+    on_value:
+      then:
+        - text_sensor.template.publish:
+            id: lr_api_response
+            state: !lambda |-
+              if (x.empty()) return std::string("(empty)");
+              char buf[96];
+              uint8_t code = (uint8_t) x[0];
+              const char* name = "?";
+              switch (code) {
+                case 0x00: name = "OK"; break;
+                case 0x81: name = "Invalid Params"; break;
+                case 0x84: name = "Invalid Id"; break;
+                case 0x87: name = "Invalid Version"; break;
+                case 0xBC: name = "Bad Command"; break;
+                case 0xFC: name = "Forbidden"; break;
+              }
+              int n = snprintf(buf, sizeof(buf), "%02X %s", code, name);
+              for (size_t i = 1; i < x.size() && n < (int)sizeof(buf) - 4; i++) {
+                n += snprintf(buf + n, sizeof(buf) - n, " %02X", (uint8_t) x[i]);
+              }
+              return std::string(buf);
+
+# -----------------------------------------------------------------------------
+# Binary sensors
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: ble_presence
+    id: ble_lr_presence
+    name: "Lamp BLE Presence"
+    icon: mdi:lamp
+    mac_address: ${lr01_mac}
+
+  - platform: status
+    name: "Node Status"
+    id: system_status
+
+# -----------------------------------------------------------------------------
+# Sensors
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi Signal"
+    update_interval: 300s
