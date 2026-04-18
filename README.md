@@ -1,4 +1,6 @@
-# Luke Roberts Lamp – ESPHome Gateway
+# Luke Roberts ESPHome Gateway
+
+> Control a Luke Roberts smart lamp from Home Assistant via an ESP32 BLE bridge.
 
 ESPHome configuration that turns an **ESP32** into a Bluetooth-LE gateway for
 **Luke Roberts** smart lamps (Model F / Luvo). Exposes the lamp as a set of
