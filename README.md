@@ -5,7 +5,7 @@ ESPHome configuration that turns an **ESP32** into a Bluetooth-LE gateway for
 Home Assistant buttons, binary sensors and text sensors — no mobile app
 required after initial setup.
 
-Built against the official **[Lamp Control API v1.3](docs/Lamp-Control-API-v1.3.pdf)**
+Built against the official **[Lamp Control API v1.3](/docs/Lamp%20Control%20API%20v1.3.pdf)**
 (Luke Roberts, 2019-07-09).
 
 ## Features
@@ -74,7 +74,7 @@ by API-version `01` or `02`.
 | Brighter (+20 %) / Dimmer (-20 %)| 08     | `A0 02 08 78` / `50`  | Multiplicative relative brightness             |
 | Immediate: Downlight 50 % 3000 K | 02     | `A0 01 02 02 0000 0BB8 80` | Flags=downlight, duration=infinite, BR=128 |
 
-See the [API PDF](docs/Lamp-Control-API-v1.3.pdf) for the full frame layout,
+See the [API PDF](/docs/Lamp%20Control%20API%20v1.3.pdf) for the full frame layout,
 response codes, and the Immediate Light uplight (HSB) sub-packet.
 
 ## Response decoding
