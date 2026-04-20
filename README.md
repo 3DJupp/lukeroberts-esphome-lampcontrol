@@ -7,7 +7,11 @@ ESPHome configuration that turns an **ESP32** into a Bluetooth-LE gateway for
 Home Assistant buttons, binary sensors and text sensors — no mobile app
 required after initial setup.
 
-Built against the official **[Lamp Control API v1.3](docs/Lamp-Control-API-v1.3.pdf)**
+<p align="center">
+  <img src="docs/dashboard.png" alt="Home Assistant dashboard with the lamp reachable" width="420">
+</p>
+
+Built against the official **[Lamp Control API v1.3](docs/Lamp%20Control%20API%20v1.3.pdf)**
 (Luke Roberts, 2019-07-09).
 
 ## Features
@@ -83,7 +87,7 @@ by API-version `01` or `02`.
 | Immediate: Downlight 50 % 3000 K | 02     | `A0 01 02 02 0000 0BB8 80` | Flags=downlight, duration=infinite, BR=128 |
 | Query Scene (id N)               | 01     | `A0 01 01 NN`         | Response carries next-id + UTF-8 name           |
 
-See the [API PDF](docs/Lamp-Control-API-v1.3.pdf) for the full frame layout,
+See the [API PDF](docs/Lamp%20Control%20API%20v1.3.pdf) for the full frame layout,
 response codes, and the Immediate Light uplight (HSB) sub-packet.
 
 ## Response decoding
@@ -181,10 +185,22 @@ into the matching button press on the gateway. See
 │   └── packages/
 │       └── lukeroberts.yaml           # optional dynamic scene dropdown package
 └── docs/
-    └── Lamp-Control-API-v1.3.pdf
+    ├── Lamp-Control-API-v1.3.pdf
+    ├── dashboard.png                  # screenshot: lamp reachable
+    └── dashboard2.png                 # screenshot: lamp not yet reachable
 ```
 
 ## Dashboard
+
+<p align="center">
+  <img src="docs/dashboard.png"  alt="Mains on, BLE reachable – full control panel" width="380">
+  &nbsp;&nbsp;
+  <img src="docs/dashboard2.png" alt="Mains on, BLE not yet reachable – waiting notice" width="380">
+</p>
+
+*Left: lamp reachable – full control panel with scene picker, brightness and
+color-temperature controls. Right: lamp powered on but not yet reachable over
+BLE – waiting notice.*
 
 Two Lovelace snippets are provided under [`dashboard/`](dashboard/):
 
