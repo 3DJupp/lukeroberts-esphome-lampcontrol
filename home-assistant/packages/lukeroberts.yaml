@@ -1,0 +1,112 @@
+# =============================================================================
+# Luke Roberts scene picker – Home Assistant package
+# -----------------------------------------------------------------------------
+# Pretty-named scene dropdown on top of the ESPHome gateway. Pulls the
+# discovered scene names from the gateway's text sensors, rebuilds the
+# option list whenever they change, and translates the user's selection
+# into the matching button press on the gateway.
+#
+# Install:
+#   1. Make sure packages are enabled in configuration.yaml:
+#
+#        homeassistant:
+#          packages: !include_dir_named packages
+#
+#   2. Drop this file into <HA_config>/packages/
+#   3. Restart Home Assistant
+#
+# Alternative (no packages): split the three sections below (input_select,
+# automation, …) into the existing configuration.yaml / automations.yaml.
+#
+# Adjust the entity prefix below if your ESPHome device is named differently.
+# =============================================================================
+
+input_select:
+  lr_scene:
+    name: "Luke Roberts Scene"
+    icon: mdi:palette-outline
+    # Populated dynamically by the automation below. "Default" is always
+    # the first option so the list is never empty.
+    options:
+      - Default
+
+automation:
+  # ---------------------------------------------------------------------------
+  # Rebuild the dropdown whenever discovered scene names change.
+  # Triggers on every change to the gateway's "Scenes Overview" sensor
+  # (which is republished on every name update) plus on HA startup.
+  # ---------------------------------------------------------------------------
+  - id: lr_scene_refresh_options
+    alias: "LR Scene – refresh options"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: sensor.esp32_s3_luke_roberts_gateway_scenes_overview
+      - platform: homeassistant
+        event: start
+    action:
+      - variables:
+          current_opts: "{{ state_attr('input_select.lr_scene', 'options') or [] }}"
+          new_opts: >-
+            {% set ns = namespace(items=['Default']) %}
+            {% for i in range(16) %}
+              {% set n = states('sensor.esp32_s3_luke_roberts_gateway_scene_' ~ i ~ '_name') %}
+              {% if n not in ['unknown', 'unavailable', 'None', ''] %}
+                {% set ns.items = ns.items + [i ~ ': ' ~ n] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.items }}
+      # Only touch set_options when the list actually changed. Avoids
+      # resetting the dropdown's current state on every unrelated
+      # overview-sensor republish.
+      - if:
+          - condition: template
+            value_template: "{{ current_opts != new_opts }}"
+        then:
+          - service: input_select.set_options
+            target:
+              entity_id: input_select.lr_scene
+            data:
+              options: "{{ new_opts }}"
+
+  # ---------------------------------------------------------------------------
+  # Translate user-initiated selections into button presses on the gateway.
+  # "Default"     → default_scene button
+  # "0: <name>"   → lamp_off button
+  # "1..15: <name>" → scene_<id> button
+  #
+  # Guarded on `context.user_id` so that programmatic state updates (e.g.
+  # the refresh automation calling set_options) don't re-fire a button press.
+  # ---------------------------------------------------------------------------
+  - id: lr_scene_apply_selection
+    alias: "LR Scene – apply selection"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.lr_scene
+    condition:
+      - condition: template
+        value_template: >-
+          {{ trigger.to_state is not none
+             and trigger.to_state.context.user_id is not none
+             and trigger.to_state.state not in ['unknown', 'unavailable'] }}
+    action:
+      - variables:
+          sel: "{{ trigger.to_state.state }}"
+          sid: "{{ sel.split(':')[0] | int(default=-1) }}"
+      - choose:
+          - conditions: "{{ sel == 'Default' }}"
+            sequence:
+              - service: button.press
+                target:
+                  entity_id: button.esp32_s3_luke_roberts_gateway_default_scene
+          - conditions: "{{ sid == 0 }}"
+            sequence:
+              - service: button.press
+                target:
+                  entity_id: button.esp32_s3_luke_roberts_gateway_lamp_off
+          - conditions: "{{ sid >= 1 and sid <= 15 }}"
+            sequence:
+              - service: button.press
+                target:
+                  entity_id: "button.esp32_s3_luke_roberts_gateway_scene_{{ sid }}"

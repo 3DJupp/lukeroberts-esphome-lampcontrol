@@ -1,4 +1,4 @@
-# Luke Roberts ESPHome Gateway
+# Luke Roberts Lamp – ESPHome Gateway
 
 > Control a Luke Roberts smart lamp from Home Assistant via an ESP32 BLE bridge.
 
@@ -7,12 +7,18 @@ ESPHome configuration that turns an **ESP32** into a Bluetooth-LE gateway for
 Home Assistant buttons, binary sensors and text sensors — no mobile app
 required after initial setup.
 
-Built against the official **[Lamp Control API v1.3](/docs/Lamp%20Control%20API%20v1.3.pdf)**
+Built against the official **[Lamp Control API v1.3](docs/Lamp-Control-API-v1.3.pdf)**
 (Luke Roberts, 2019-07-09).
 
 ## Features
 
-- Scene selection, on/off, default scene
+- Scene selection for up to **16 scenes (ids 0–15)**, plus *Off* (id 0) and
+  *Default* (id 255 — the power-up scene), addressable either via individual
+  buttons or a single **Scene** dropdown (`select` entity)
+- **Automatic scene-name discovery** on connect — walks the lamp's scene list
+  via the Query Scene opcode and publishes each name as a separate HA text
+  sensor, plus a combined "Scenes Overview" summary string
+- Manual "Refresh Scenes" button to re-walk the list on demand
 - Brightness adjustment (absolute percent, relative multiplier, next brighter / dimmer)
 - Color temperature (2700 K – 4000 K)
 - Immediate Light command (transient brightness + kelvin)
@@ -75,8 +81,9 @@ by API-version `01` or `02`.
 | Next Dimmer Scene                | 06     | `A0 02 06 FF`         | Signed -1                                      |
 | Brighter (+20 %) / Dimmer (-20 %)| 08     | `A0 02 08 78` / `50`  | Multiplicative relative brightness             |
 | Immediate: Downlight 50 % 3000 K | 02     | `A0 01 02 02 0000 0BB8 80` | Flags=downlight, duration=infinite, BR=128 |
+| Query Scene (id N)               | 01     | `A0 01 01 NN`         | Response carries next-id + UTF-8 name           |
 
-See the [API PDF](/docs/Lamp%20Control%20API%20v1.3.pdf) for the full frame layout,
+See the [API PDF](docs/Lamp-Control-API-v1.3.pdf) for the full frame layout,
 response codes, and the Immediate Light uplight (HSB) sub-packet.
 
 ## Response decoding
@@ -94,6 +101,55 @@ Each write triggers a notification carrying the status byte:
 
 The decoded response is published live to the HA text sensor
 **`Luke Roberts API Response`** (diagnostic category).
+
+## Scene discovery
+
+On every successful connect (and on demand via **Refresh Scenes**) the gateway
+walks the lamp's scene list using the `Query Scene` opcode (`A0 01 01 NN`):
+
+1. Start at id `0x00`.
+2. Each response looks like `00 01 NN <utf-8 name bytes> 00`, where `NN` is
+   the next valid scene id (or `0xFF` when the end of the list is reached).
+3. The gateway publishes the decoded name to `sensor..._scene_N_name` and
+   fires the next query after ~100 ms, stopping at `0xFF` or any error.
+
+The names are then available as:
+
+- `sensor.esp32_s3_luke_roberts_gateway_scene_N_name` (one per id, 0–15)
+- `sensor.esp32_s3_luke_roberts_gateway_scenes_overview` — a combined
+  `"0: Off | 1: Reading | 2: Movie | 3: Evening | …"` string, handy for a
+  single-glance display
+
+Only id 0 (Off) and any configured user scenes return a name — unconfigured
+slots remain empty.
+
+## Scene dropdown (`select` entity)
+
+For single-click control, the gateway exposes `select.<name>_scene` with a
+fixed options list:
+
+```
+Default, Off (0), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+```
+
+Selecting an option fires `Select Scene` (`A0 02 05 NN`) — `Default` maps to
+`0xFF`, the others to their numeric id. The options are **static** because
+HA only fetches an ESPHome entity's options list once on connect, so the
+discovered scene *names* are intentionally **not** merged into the dropdown
+labels. Instead, the companion `Scenes Overview` text sensor beside it shows
+`"0: Off | 1: Reading | 2: Movie | …"` so you can tell at a glance which
+id maps to which configured scene.
+
+### Optional: pretty-named dropdown on the HA side
+
+If you want a dropdown whose options actually read `"1: Welcome!"`,
+`"2: Highlights"`, … instead of bare ids, drop the package under
+[`home-assistant/`](home-assistant/) into your HA config. It creates an
+`input_select.lr_scene` helper and two automations that keep the option list
+in sync with the discovered scene-name sensors and translate a selection
+into the matching button press on the gateway. See
+[`home-assistant/README.md`](home-assistant/README.md) for install steps.
+
 
 ## Connection behaviour
 
@@ -114,25 +170,74 @@ The decoded response is published live to the HA text sensor
 .
 ├── README.md
 ├── LICENSE
-├── luke-roberts-lamp.yaml      # the ESPHome config
-├── secrets.yaml.example        # Wi-Fi credential template
+├── luke-roberts-lamp.yaml             # the ESPHome config
+├── secrets.yaml.example               # Wi-Fi credential template
+├── dashboard/
+│   ├── README.md
+│   ├── lamp-card.yaml                 # main Lovelace card (everyday controls)
+│   └── diagnostics-card.yaml          # admin Lovelace card (ping / restart / …)
+├── home-assistant/
+│   ├── README.md
+│   └── packages/
+│       └── lukeroberts.yaml           # optional dynamic scene dropdown package
 └── docs/
     └── Lamp-Control-API-v1.3.pdf
 ```
+
+## Dashboard
+
+Two Lovelace snippets are provided under [`dashboard/`](dashboard/):
+
+- [`lamp-card.yaml`](dashboard/lamp-card.yaml) – main card for everyday use.
+  Switches automatically between three states via `conditional` cards:
+  - **mains off** → only the status glance row is shown
+  - **mains on, BLE not reachable** → a short waiting notice
+  - **mains on, BLE reachable** → full control panel (Off / Default, pretty-
+    named scene picker, Dimmer/Brighter scene, brightness ±20 % / 50 %,
+    color temperature)
+- [`diagnostics-card.yaml`](dashboard/diagnostics-card.yaml) – admin card
+  with Ping / Restart / Refresh scenes / last API response / device info,
+  gated by a `visibility:` block so it's only rendered for a specific HA
+  user id and while the mains switch is on.
+
+The main card uses only core HA cards plus optionally
+`custom:mushroom-select-card` (HACS) for the scene dropdown. If you don't
+have Mushroom, swap that block for a plain `entities` card listing
+`input_select.lr_scene`.
+
+Before pasting, replace the placeholders in both files:
+
+- `light.your_lamp_power_switch` → whatever switch feeds mains to your lamp
+- `REPLACE_WITH_YOUR_HA_USER_ID` (diagnostics card) → your HA user id
+
+See [`dashboard/README.md`](dashboard/README.md) for install instructions and
+the full list of entity ids the cards reference.
 
 ## Extending
 
 Ideas that fit cleanly on top of this base:
 
-- **Scene list as a `select` entity** — use `A0 01 01 II` (Query Scene) to
-  walk the scene list on connect and populate a dropdown with real names.
 - **Unified `light.template` entity** — expose brightness + color-temperature
   through a single HA light instead of separate buttons (uses `03` + `04`
   under the hood).
 - **Long-press / click-detection passthrough** if you mount the ESP near the
   lamp and want it to mirror the click events.
+- **Active-scene feedback** — the protocol has no "currently active scene"
+  query, so the `select` entity tracks the last command sent rather than the
+  lamp's actual state. A future extension could persist that via
+  `restore_value: true` or mirror manual app changes through another channel.
 
 Pull requests welcome.
+
+## GitHub repo description (suggested)
+
+Short one-liner for the GitHub repo's "About" field:
+
+> Control Luke Roberts smart lamps (Model F / Luvo) from Home Assistant via an
+> ESPHome BLE gateway. Scenes, brightness, color temperature.
+
+**Topics:** `esphome` `home-assistant` `luke-roberts` `smart-lamp` `bluetooth-le`
+`esp32` `ble-gateway`
 
 ## Credits
 

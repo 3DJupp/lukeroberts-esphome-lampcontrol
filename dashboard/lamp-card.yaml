@@ -1,0 +1,160 @@
+# -----------------------------------------------------------------------------
+# Luke Roberts – main Lovelace card
+# -----------------------------------------------------------------------------
+# Three-state UI for day-to-day lamp control:
+#
+#   - mains off                  -> (nothing shown, the glance row conveys it)
+#   - mains on, BLE not reachable -> short "waiting" notice
+#   - mains on, BLE reachable     -> Off/Default + scene picker + brightness /
+#                                    color temperature controls
+#
+# Dependencies:
+#   - `input_select.lr_scene` – optional pretty-named dropdown helper from the
+#     HA-side package in home-assistant/ (see ../home-assistant/README.md).
+#   - `custom:mushroom-select-card` – HACS card for a nicer select UX. If you
+#     don't have Mushroom installed, replace that block with a plain
+#     `entities` card that lists `input_select.lr_scene`.
+#
+# Replace `light.your_lamp_power_switch` below with the entity id of whatever
+# switch feeds mains to your lamp (e.g. a Shelly, a smart plug, …).
+# -----------------------------------------------------------------------------
+
+type: vertical-stack
+cards:
+  - type: heading
+    heading: Luke Roberts Lamp
+    icon: mdi:lamp
+
+  - type: glance
+    show_name: true
+    show_state: true
+    columns: 2
+    entities:
+      - entity: light.your_lamp_power_switch
+        name: Power
+        icon: mdi:power-plug
+        tap_action:
+          action: none
+        hold_action:
+          action: toggle
+      - entity: binary_sensor.esp32_s3_luke_roberts_gateway_lamp_ble_presence
+        name: BLE
+        icon: mdi:bluetooth
+
+  # Mains on, but BLE not yet reachable -> waiting notice
+  - type: conditional
+    conditions:
+      - entity: light.your_lamp_power_switch
+        state: "on"
+      - entity: binary_sensor.esp32_s3_luke_roberts_gateway_lamp_ble_presence
+        state: "off"
+    card:
+      type: markdown
+      content: >
+        **Lamp powered on but not yet reachable over BLE.**
+        Waiting for the lamp to advertise. If this persists for more than ~10 s,
+        check that the ESP32 gateway is online and within BLE range.
+
+  # Mains on + BLE reachable -> full control panel
+  - type: conditional
+    conditions:
+      - entity: light.your_lamp_power_switch
+        state: "on"
+      - entity: binary_sensor.esp32_s3_luke_roberts_gateway_lamp_ble_presence
+        state: "on"
+    card:
+      type: vertical-stack
+      cards:
+        # Off / Default quick buttons
+        - type: grid
+          columns: 2
+          square: false
+          cards:
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_lamp_off
+              name: "Off"
+              icon: mdi:lamp-outline
+              show_state: false
+              tap_action:
+                action: toggle
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_default_scene
+              name: Default
+              icon: mdi:restore
+              show_state: false
+              tap_action:
+                action: toggle
+
+        # Pretty-named scene picker (from the home-assistant/ package)
+        - type: custom:mushroom-select-card
+          entity: input_select.lr_scene
+          primary_info: name
+          secondary_info: last-updated
+
+        # Scene navigation (relative)
+        - type: grid
+          columns: 2
+          square: false
+          cards:
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_next_dimmer_scene
+              name: Dimmer Scene
+              icon: mdi:arrow-down-bold
+              show_state: false
+              tap_action:
+                action: toggle
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_next_brighter_scene
+              name: Brighter Scene
+              icon: mdi:arrow-up-bold
+              show_state: false
+              tap_action:
+                action: toggle
+
+        # Brightness – relative ±20 % plus absolute 50 % preset
+        - type: grid
+          columns: 3
+          square: false
+          cards:
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_dimmer_20
+              name: "-20%"
+              icon: mdi:brightness-3
+              show_state: false
+              tap_action:
+                action: toggle
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_brightness_50
+              name: 50%
+              icon: mdi:brightness-5
+              show_state: false
+              tap_action:
+                action: toggle
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_brighter_20
+              name: +20%
+              icon: mdi:brightness-7
+              show_state: false
+              tap_action:
+                action: toggle
+
+        # Color temperature presets
+        - type: grid
+          columns: 2
+          square: false
+          cards:
+            - type: button
+              entity: button.esp32_s3_luke_roberts_gateway_color_temperature_3000k
+              name: 3000 K
+              icon: mdi:thermometer
+              show_state: false
+              tap_action:
+                action: toggle
+            - type: button
+              entity: >-
+                button.esp32_s3_luke_roberts_gateway_immediate_downlight_50_3000k
+              name: DL 50% 3000K
+              icon: mdi:lightbulb-on
+              show_state: false
+              tap_action:
+                action: toggle

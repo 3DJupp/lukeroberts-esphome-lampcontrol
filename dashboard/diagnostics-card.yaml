@@ -1,0 +1,50 @@
+# -----------------------------------------------------------------------------
+# Luke Roberts – Diagnostics / admin card
+# -----------------------------------------------------------------------------
+# Paired with `lamp-card.yaml`. Kept in a separate card so it can be hidden
+# from non-admin users and/or when the lamp is powered off.
+#
+# The `visibility:` block below shows the card only when BOTH conditions are
+# true:
+#   1. the viewer is a specific HA user   -> replace the user id placeholder
+#   2. the mains switch is currently on   -> replace the light entity
+#
+# Both guards are optional. Drop the block entirely if you'd rather show the
+# diagnostics to everyone, or keep just the user guard to hide it from guests
+# even when the lamp is running.
+# -----------------------------------------------------------------------------
+
+type: entities
+title: Diagnostics
+show_header_toggle: false
+entities:
+  - entity: button.esp32_s3_luke_roberts_gateway_ping
+    name: Ping
+    icon: mdi:access-point
+  - entity: button.esp32_s3_luke_roberts_gateway_restart
+    name: Restart gateway
+    icon: mdi:restart
+  - entity: button.esp32_s3_luke_roberts_gateway_refresh_scenes
+    name: Refresh scenes
+    icon: mdi:numeric-10-box-multiple-outline
+  - entity: sensor.esp32_s3_luke_roberts_gateway_luke_roberts_api_response
+    name: Last API response
+    icon: mdi:message-reply-text
+  - entity: sensor.esp32_s3_luke_roberts_gateway_firmware_revision
+    name: Firmware
+  - entity: sensor.esp32_s3_luke_roberts_gateway_model_number
+    name: Model
+  - entity: sensor.esp32_s3_luke_roberts_gateway_serial_number
+    name: Serial
+visibility:
+  # Only show this card to a specific HA user. Replace the placeholder with
+  # your own user id – find it under Settings -> People -> pick a user ->
+  # "User ID" (a 32-char hex string).
+  - condition: user
+    users:
+      - REPLACE_WITH_YOUR_HA_USER_ID
+  # Only show this card while the lamp's mains switch is on. Replace the
+  # entity id with whatever switch feeds mains to your lamp.
+  - condition: state
+    entity: light.your_lamp_power_switch
+    state: "on"

@@ -15,6 +15,11 @@
 # The lamp automatically drops the BLE connection after ~8 s of inactivity
 # (firmware >= 1.1.1). A lightweight ping keepalive keeps the link alive
 # while the user is actively interacting.
+#
+# Scene enumeration:
+#   On (re)connect – and on demand via the "Refresh Scenes" button – the
+#   gateway walks the scene list using 01 Query Scene and publishes each
+#   scene name to a dedicated text sensor plus a combined "Scenes Overview".
 # =============================================================================
 
 substitutions:
@@ -38,6 +43,9 @@ substitutions:
 
   # --- Keepalive ping interval (must be < 8 s lamp idle timeout) -------------
   lr_keepalive: "6s"
+
+  # --- BLE presence debounce (binary_sensor "off" after missing this long) ---
+  ble_presence_timeout: "60s"
 
 esphome:
   name: ${name}
@@ -88,7 +96,11 @@ light:
           update_interval: 550ms
 
 # -----------------------------------------------------------------------------
-# Globals for keepalive bookkeeping
+# Globals
+# - lr_last_cmd_ms / lr_want_keepalive: keepalive bookkeeping
+# - lr_enum_current_id: scene enumeration state machine.
+#     0xFE = not enumerating, 0x00..0xFD = currently querying that scene id
+# - lr_scenes_loaded: becomes true after a successful enumeration pass
 # -----------------------------------------------------------------------------
 globals:
   - id: lr_last_cmd_ms
@@ -99,11 +111,26 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: lr_enum_current_id
+    type: uint8_t
+    restore_value: no
+    initial_value: '0xFE'
+  - id: lr_scenes_loaded
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Scratch slot used by the Scene select's set_action to hand the parsed
+  # scene id over to the deferred `lr_send` call. 0xFE = "no valid selection".
+  - id: lr_pending_scene
+    type: uint8_t
+    restore_value: no
+    initial_value: '0xFE'
 
 # -----------------------------------------------------------------------------
 # BLE client
 # auto_connect keeps the link up / reconnects automatically.
-# on_connect: read Device Information (service 0x180A) once.
+# on_connect: read Device Information (service 0x180A) once, then kick off
+# scene enumeration if not already loaded.
 # -----------------------------------------------------------------------------
 ble_client:
   - mac_address: ${lr01_mac}
@@ -118,17 +145,26 @@ ble_client:
         - component.update: internal_model_number
         - component.update: internal_serial_number
         - component.update: internal_software_revision
+        # Kick off scene enumeration on the first successful connect
+        - delay: 1500ms
+        - if:
+            condition:
+              lambda: 'return !id(lr_scenes_loaded);'
+            then:
+              - script.execute: lr_enumerate_scenes
     on_disconnect:
       then:
         - logger.log: "Luke Roberts lamp disconnected"
+        # Abort any in-flight enumeration – a fresh pass will start on reconnect
+        - lambda: 'id(lr_enum_current_id) = 0xFE;'
 
 # -----------------------------------------------------------------------------
-# Main send script
-# If already connected, write immediately (<100 ms latency).
-# Otherwise connect first, wait for the link, then write. Never manually
-# disconnects – the lamp's own idle timeout handles that.
+# Scripts
 # -----------------------------------------------------------------------------
 script:
+  # --- Core send helper -------------------------------------------------------
+  # Writes a payload to the External API characteristic. Connects first if
+  # the link is down. Never manually disconnects.
   - id: lr_send
     mode: single
     parameters:
@@ -158,11 +194,54 @@ script:
           format: "Lamp <- %d bytes"
           args: ['payload.size()']
 
+  # --- Scene enumeration: kick off at id 0 -----------------------------------
+  - id: lr_enumerate_scenes
+    mode: restart
+    then:
+      - logger.log: "Starting scene enumeration"
+      - lambda: |-
+          id(lr_enum_current_id) = 0x00;
+          id(lr_scenes_loaded) = false;
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x01, 0x01, 0x00};'   # Query Scene 0
+
+  # --- Rebuild the combined "Scenes Overview" from all known names -----------
+  - id: lr_rebuild_summary
+    mode: restart
+    then:
+      - lambda: |-
+          std::string summary;
+          auto add = [&](int idx, esphome::text_sensor::TextSensor* s) {
+            if (s && s->has_state() && !s->state.empty()) {
+              char buf[64];
+              snprintf(buf, sizeof(buf), "%d: %s", idx, s->state.c_str());
+              if (!summary.empty()) summary += " | ";
+              summary += buf;
+            }
+          };
+          add(0,  id(scene_0_name));
+          add(1,  id(scene_1_name));
+          add(2,  id(scene_2_name));
+          add(3,  id(scene_3_name));
+          add(4,  id(scene_4_name));
+          add(5,  id(scene_5_name));
+          add(6,  id(scene_6_name));
+          add(7,  id(scene_7_name));
+          add(8,  id(scene_8_name));
+          add(9,  id(scene_9_name));
+          add(10, id(scene_10_name));
+          add(11, id(scene_11_name));
+          add(12, id(scene_12_name));
+          add(13, id(scene_13_name));
+          add(14, id(scene_14_name));
+          add(15, id(scene_15_name));
+          if (summary.empty()) summary = "(no scenes loaded)";
+          id(scenes_overview).publish_state(summary);
+
 # -----------------------------------------------------------------------------
 # Keepalive using the official Ping command (A0 02 00).
 # Active only for 30 s after the last user command, and only while connected.
-# Once the user has been idle for 30 s the ping stops and the lamp is allowed
-# to disconnect normally.
 # -----------------------------------------------------------------------------
 interval:
   - interval: ${lr_keepalive}
@@ -187,20 +266,97 @@ interval:
             - lambda: 'id(lr_want_keepalive) = false;'
 
 # -----------------------------------------------------------------------------
+# Select – single-dropdown scene picker
+# -----------------------------------------------------------------------------
+# ESPHome template selects have a *static* options list: HA fetches it once
+# at connect and never refetches. So dynamic "auto-filled from scene names"
+# options can't be done sanely from the ESPHome side – we keep a fixed list
+# of scene ids (plus "Default" for id 0xFF) and show the discovered names in
+# the companion `Scenes Overview` text sensor.
+#
+# Mapping: selection string → scene id
+#   "Default"  → 0xFF (power-up scene)
+#   "Off (0)"  → 0
+#   "1".."15"  → 1..15
+# -----------------------------------------------------------------------------
+select:
+  - platform: template
+    name: "Scene"
+    id: scene_select
+    icon: mdi:palette-outline
+    optimistic: true
+    restore_value: false
+    options:
+      - "Default"
+      - "Off (0)"
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "6"
+      - "7"
+      - "8"
+      - "9"
+      - "10"
+      - "11"
+      - "12"
+      - "13"
+      - "14"
+      - "15"
+    initial_option: "Default"
+    set_action:
+      # Step 1: parse the selected option into a scene id (stored in the
+      # lr_pending_scene global so the next action can pick it up).
+      - lambda: |-
+          int sid = -1;
+          if (x == "Default") {
+            sid = 0xFF;
+          } else if (x == "Off (0)") {
+            sid = 0;
+          } else {
+            int n;
+            if (sscanf(x.c_str(), "%d", &n) == 1 && n >= 0 && n <= 15) {
+              sid = n;
+            }
+          }
+          id(lr_pending_scene) = (sid >= 0) ? (uint8_t) sid : 0xFE;
+      # Step 2: if the parse succeeded, fire the Select Scene command.
+      - if:
+          condition:
+            lambda: 'return id(lr_pending_scene) != 0xFE;'
+          then:
+            - script.execute:
+                id: lr_send
+                payload: !lambda |-
+                  return {0xA0, 0x02, 0x05, id(lr_pending_scene)};
+            - lambda: 'id(lr_pending_scene) = 0xFE;'
+
+# -----------------------------------------------------------------------------
 # Buttons – all byte sequences verified against Lamp Control API v1.3
 # -----------------------------------------------------------------------------
 button:
   - platform: restart
     name: "Restart"
 
-  # --- Diagnostic ping --------------------------------------------------------
+  # --- Diagnostics -----------------------------------------------------------
   - platform: template
     name: "Ping"
+    id: diag_ping
     icon: mdi:access-point
+    entity_category: diagnostic
     on_press:
       - script.execute:
           id: lr_send
           payload: !lambda 'return {0xA0, 0x02, 0x00};'   # Ping V=2
+
+  - platform: template
+    name: "Refresh Scenes"
+    id: refresh_scenes
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      - script.execute: lr_enumerate_scenes
 
   # --- Power / Scenes (A0 02 05 II) ------------------------------------------
   - platform: template
@@ -209,7 +365,7 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x00};'   # Off scene
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x00};'
 
   - platform: template
     name: "Default Scene"
@@ -217,10 +373,12 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x05, 0xFF};'   # Power-up scene
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0xFF};'
 
   - platform: template
     name: "Scene 1"
+    id: scene1
+    icon: mdi:numeric-1-circle-outline
     on_press:
       - script.execute:
           id: lr_send
@@ -228,10 +386,129 @@ button:
 
   - platform: template
     name: "Scene 2"
+    id: scene2
+    icon: mdi:numeric-2-circle-outline
     on_press:
       - script.execute:
           id: lr_send
           payload: !lambda 'return {0xA0, 0x02, 0x05, 0x02};'
+
+  - platform: template
+    name: "Scene 3"
+    id: scene3
+    icon: mdi:numeric-3-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x03};'
+
+  - platform: template
+    name: "Scene 4"
+    id: scene4
+    icon: mdi:numeric-4-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x04};'
+
+  - platform: template
+    name: "Scene 5"
+    id: scene5
+    icon: mdi:numeric-5-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x05};'
+
+  - platform: template
+    name: "Scene 6"
+    id: scene6
+    icon: mdi:numeric-6-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x06};'
+
+  - platform: template
+    name: "Scene 7"
+    id: scene7
+    icon: mdi:numeric-7-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x07};'
+
+  - platform: template
+    name: "Scene 8"
+    id: scene8
+    icon: mdi:numeric-8-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x08};'
+
+  - platform: template
+    name: "Scene 9"
+    id: scene9
+    icon: mdi:numeric-9-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x09};'
+
+  - platform: template
+    name: "Scene 10"
+    id: scene10
+    icon: mdi:numeric-10-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0A};'
+
+  - platform: template
+    name: "Scene 11"
+    id: scene11
+    icon: mdi:numeric-11-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0B};'
+
+  - platform: template
+    name: "Scene 12"
+    id: scene12
+    icon: mdi:numeric-12-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0C};'
+
+  - platform: template
+    name: "Scene 13"
+    id: scene13
+    icon: mdi:numeric-13-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0D};'
+
+  - platform: template
+    name: "Scene 14"
+    id: scene14
+    icon: mdi:numeric-14-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0E};'
+
+  - platform: template
+    name: "Scene 15"
+    id: scene15
+    icon: mdi:numeric-15-circle-outline
+    on_press:
+      - script.execute:
+          id: lr_send
+          payload: !lambda 'return {0xA0, 0x02, 0x05, 0x0F};'
 
   # --- Modify Brightness (opcode 03, value in percent 0..100) ----------------
   - platform: template
@@ -260,7 +537,7 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x06, 0x01};'   # +1
+          payload: !lambda 'return {0xA0, 0x02, 0x06, 0x01};'
 
   - platform: template
     name: "Next Dimmer Scene"
@@ -268,7 +545,7 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x06, 0xFF};'   # -1 (signed)
+          payload: !lambda 'return {0xA0, 0x02, 0x06, 0xFF};'
 
   # --- Relative Brightness (opcode 08, multiplicative, percent) --------------
   - platform: template
@@ -277,7 +554,7 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x78};'   # 120% = 0x78
+          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x78};'   # 120%
 
   - platform: template
     name: "Dimmer (-20%)"
@@ -285,17 +562,14 @@ button:
     on_press:
       - script.execute:
           id: lr_send
-          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x50};'   # 80% = 0x50
+          payload: !lambda 'return {0xA0, 0x02, 0x08, 0x50};'   # 80%
 
   # --- Immediate Light (opcode 02) -------------------------------------------
   # Structure: A0 01 02 XX DDDD [01 SS HHHH BB] [02 KKKK BB]
   #   XX    = flags bitfield (bit0: uplight sub-packet, bit1: downlight)
   #   DDDD  = duration in ms (0 = infinite, reverts on next scene select)
-  #   SS    = saturation 0..255
-  #   HHHH  = hue 0..65535 (or Kelvin when SS = 0)
   #   KKKK  = Kelvin 2700..4000
   #   BB    = brightness 0..255  (NOTE: not a percentage here)
-  # Example: downlight only, infinite, 3000 K, brightness ~50% (128/255)
   - platform: template
     name: "Immediate: Downlight 50% 3000K"
     icon: mdi:lightbulb-on
@@ -313,13 +587,15 @@ button:
 # Text sensors
 # - Device Information (service 0x180A): pulled once on connect
 # - Luke Roberts API Response: decoded live from the External API notify
+# - Scene N Name: populated by enumeration (01 Query Scene walk)
+# - Scenes Overview: concatenated "id: name | id: name …" for dashboards
 # -----------------------------------------------------------------------------
 text_sensor:
   - platform: uptime
     name: "Uptime"
     icon: mdi:clock-check-outline
 
-  # --- Visible diagnostic sensors --------------------------------------------
+  # --- Visible diagnostic sensors (Device Information Service) ---------------
   - platform: template
     name: "Manufacturer"
     id: manufacturer
@@ -355,6 +631,77 @@ text_sensor:
     id: software_revision
     icon: mdi:code-braces
     entity_category: diagnostic
+
+  # --- Scene name sensors (populated by enumeration) -------------------------
+  - platform: template
+    name: "Scene 0 Name"
+    id: scene_0_name
+    icon: mdi:numeric-0-circle-outline
+  - platform: template
+    name: "Scene 1 Name"
+    id: scene_1_name
+    icon: mdi:numeric-1-circle-outline
+  - platform: template
+    name: "Scene 2 Name"
+    id: scene_2_name
+    icon: mdi:numeric-2-circle-outline
+  - platform: template
+    name: "Scene 3 Name"
+    id: scene_3_name
+    icon: mdi:numeric-3-circle-outline
+  - platform: template
+    name: "Scene 4 Name"
+    id: scene_4_name
+    icon: mdi:numeric-4-circle-outline
+  - platform: template
+    name: "Scene 5 Name"
+    id: scene_5_name
+    icon: mdi:numeric-5-circle-outline
+  - platform: template
+    name: "Scene 6 Name"
+    id: scene_6_name
+    icon: mdi:numeric-6-circle-outline
+  - platform: template
+    name: "Scene 7 Name"
+    id: scene_7_name
+    icon: mdi:numeric-7-circle-outline
+  - platform: template
+    name: "Scene 8 Name"
+    id: scene_8_name
+    icon: mdi:numeric-8-circle-outline
+  - platform: template
+    name: "Scene 9 Name"
+    id: scene_9_name
+    icon: mdi:numeric-9-circle-outline
+  - platform: template
+    name: "Scene 10 Name"
+    id: scene_10_name
+    icon: mdi:numeric-10-circle-outline
+  - platform: template
+    name: "Scene 11 Name"
+    id: scene_11_name
+    icon: mdi:numeric-11-circle-outline
+  - platform: template
+    name: "Scene 12 Name"
+    id: scene_12_name
+    icon: mdi:numeric-12-circle-outline
+  - platform: template
+    name: "Scene 13 Name"
+    id: scene_13_name
+    icon: mdi:numeric-13-circle-outline
+  - platform: template
+    name: "Scene 14 Name"
+    id: scene_14_name
+    icon: mdi:numeric-14-circle-outline
+  - platform: template
+    name: "Scene 15 Name"
+    id: scene_15_name
+    icon: mdi:numeric-15-circle-outline
+
+  - platform: template
+    name: "Scenes Overview"
+    id: scenes_overview
+    icon: mdi:format-list-bulleted
 
   # --- Internal BLE readers (Device Information Service 0x180A) ---------------
   - platform: ble_client
@@ -461,9 +808,11 @@ text_sensor:
     entity_category: diagnostic
 
   # --- Internal notify listener on the External API characteristic ------------
-  # Decodes status codes from Lamp Control API v1.3:
-  #   00 OK | 81 Invalid Params | 84 Invalid Id
-  #   87 Invalid Version | BC Bad Command | FC Forbidden
+  # Two jobs:
+  #   1. Decode every response into the visible `lr_api_response` sensor.
+  #   2. If a scene enumeration is in progress, parse 01 Query Scene responses,
+  #      publish each scene name and step to the next id.
+  #
   # `x` arrives as std::string where every char is a raw byte.
   - platform: ble_client
     id: lr_api_response_raw
@@ -475,6 +824,7 @@ text_sensor:
     update_interval: never
     on_value:
       then:
+        # 1) Raw hex + status decoding into lr_api_response
         - text_sensor.template.publish:
             id: lr_api_response
             state: !lambda |-
@@ -496,6 +846,85 @@ text_sensor:
               }
               return std::string(buf);
 
+        # 2) Scene enumeration handling ----------------------------------------
+        # Only acts while lr_enum_current_id is in the "active" range (0..0xFD).
+        # Successful Query Scene responses look like: 00 01 NN <name bytes> 00
+        - if:
+            condition:
+              lambda: |-
+                return id(lr_enum_current_id) != 0xFE
+                    && x.size() >= 4
+                    && (uint8_t) x[0] == 0x00
+                    && (uint8_t) x[1] == 0x01;
+            then:
+              - lambda: |-
+                  uint8_t current = id(lr_enum_current_id);
+                  uint8_t next    = (uint8_t) x[2];
+
+                  // Extract name (null-terminated UTF-8, up to ~20 bytes)
+                  std::string name;
+                  for (size_t i = 3; i < x.size() && x[i] != 0; i++) {
+                    name.push_back(x[i]);
+                  }
+                  if (name.empty()) name = "(unnamed)";
+
+                  // Publish into the matching scene_<id>_name sensor
+                  switch (current) {
+                    case 0:  id(scene_0_name ).publish_state(name); break;
+                    case 1:  id(scene_1_name ).publish_state(name); break;
+                    case 2:  id(scene_2_name ).publish_state(name); break;
+                    case 3:  id(scene_3_name ).publish_state(name); break;
+                    case 4:  id(scene_4_name ).publish_state(name); break;
+                    case 5:  id(scene_5_name ).publish_state(name); break;
+                    case 6:  id(scene_6_name ).publish_state(name); break;
+                    case 7:  id(scene_7_name ).publish_state(name); break;
+                    case 8:  id(scene_8_name ).publish_state(name); break;
+                    case 9:  id(scene_9_name ).publish_state(name); break;
+                    case 10: id(scene_10_name).publish_state(name); break;
+                    case 11: id(scene_11_name).publish_state(name); break;
+                    case 12: id(scene_12_name).publish_state(name); break;
+                    case 13: id(scene_13_name).publish_state(name); break;
+                    case 14: id(scene_14_name).publish_state(name); break;
+                    case 15: id(scene_15_name).publish_state(name); break;
+                  }
+
+                  ESP_LOGI("lr", "Scene %u: '%s' (next %u)", current,
+                           name.c_str(), next);
+
+                  // Decide if enumeration continues
+                  if (next == 0xFF || next == current) {
+                    id(lr_enum_current_id) = 0xFE;
+                    id(lr_scenes_loaded)   = true;
+                  } else {
+                    id(lr_enum_current_id) = next;
+                  }
+              # Always rebuild the summary after any name change
+              - script.execute: lr_rebuild_summary
+              # If there's still a next id queued, fire the next query
+              - if:
+                  condition:
+                    lambda: 'return id(lr_enum_current_id) != 0xFE;'
+                  then:
+                    - delay: 100ms
+                    - script.execute:
+                        id: lr_send
+                        payload: !lambda |-
+                          return {0xA0, 0x01, 0x01, id(lr_enum_current_id)};
+
+        # Abort enumeration on error responses (e.g. Invalid Id 0x84)
+        - if:
+            condition:
+              lambda: |-
+                return id(lr_enum_current_id) != 0xFE
+                    && !x.empty()
+                    && (uint8_t) x[0] != 0x00;
+            then:
+              - logger.log:
+                  format: "Scene enumeration aborted, status=%02X"
+                  args: ['(uint8_t) x[0]']
+              - lambda: |-
+                  id(lr_enum_current_id) = 0xFE;
+
 # -----------------------------------------------------------------------------
 # Binary sensors
 # -----------------------------------------------------------------------------
@@ -505,6 +934,7 @@ binary_sensor:
     name: "Lamp BLE Presence"
     icon: mdi:lamp
     mac_address: ${lr01_mac}
+    timeout: ${ble_presence_timeout}
 
   - platform: status
     name: "Node Status"
