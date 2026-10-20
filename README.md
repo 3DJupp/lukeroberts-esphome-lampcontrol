@@ -7,6 +7,13 @@ ESPHome configuration that turns an **ESP32** into a Bluetooth-LE gateway for
 Home Assistant buttons, binary sensors and text sensors — no mobile app
 required after initial setup.
 
+> **Looking for a setup without a dedicated ESP32?** The follow-up project
+> [lukeroberts-homeassistant](https://github.com/3DJupp/lukeroberts-homeassistant)
+> is a native Home Assistant integration that talks to the lamp through your
+> existing Bluetooth adapters and proxies (ESPHome, Shelly, ...) and can fall
+> back to the Luke Roberts cloud. An ESP32 running this gateway can be reused
+> as a plain ESPHome Bluetooth proxy for it.
+
 <p align="center">
   <img src="docs/dashboard.png" alt="Home Assistant dashboard with the lamp reachable" width="420">
 </p>
