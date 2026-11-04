@@ -10,7 +10,7 @@ required after initial setup.
 > **Looking for a setup without a dedicated ESP32?** The follow-up project
 > [lukeroberts-homeassistant](https://github.com/3DJupp/lukeroberts-homeassistant)
 > is a native Home Assistant integration that talks to the lamp through your
-> existing Bluetooth adapters and proxies (ESPHome, Shelly, ...) and can fall
+> existing Bluetooth adapters and proxies (ESPHome, ...) and can fall
 > back to the Luke Roberts cloud. An ESP32 running this gateway can be reused
 > as a plain ESPHome Bluetooth proxy for it.
 
